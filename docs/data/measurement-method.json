@@ -1,0 +1,50 @@
+{
+  "basic": {
+    "width": 1280,
+    "height": 720,
+    "format": "bgra8unorm",
+    "batchSize": 16,
+    "rounds": 5,
+    "framesPerRun": 192,
+    "warmupFrames": 64,
+    "conditioningFrames": 1216,
+    "conditioningWallMs": 3032.5999999940395,
+    "seed": 20261024,
+    "settings": {
+      "scale": 1,
+      "sorting": true,
+      "shDegree": 3
+    },
+    "sortWorkgroup": 256,
+    "timestamps": "GPU pass begin/end, nanoseconds; no browser precision flags; raw stamps retained",
+    "total": "preprocess begin to render end (point cloud: render only); excludes initial counter clears and final readback",
+    "readbacks": "one query resolve and map per batch, outside measured pass interval; no counter polling",
+    "target": "offscreen GPU texture, identical format/size/pipelines to viewer; no requestAnimationFrame or vsync",
+    "order": "seeded permutation, rotate by 5 positions each round; every configuration once per round",
+    "wallTime": "batch encoding + submit + query readback wait, not interactive application FPS"
+  },
+  "precision": {
+    "width": 1280,
+    "height": 720,
+    "format": "bgra8unorm",
+    "batchSize": 16,
+    "rounds": 6,
+    "framesPerRun": 384,
+    "warmupFrames": 64,
+    "conditioningFrames": 1152,
+    "conditioningWallMs": 3036.2999999821186,
+    "seed": 20261024,
+    "settings": {
+      "scale": 1,
+      "sorting": true,
+      "shDegree": 3
+    },
+    "sortWorkgroup": 256,
+    "timestamps": "GPU pass begin/end, nanoseconds; no browser precision flags; raw stamps retained",
+    "total": "preprocess begin to render end (point cloud: render only); excludes initial counter clears and final readback",
+    "readbacks": "one query resolve and map per batch, outside measured pass interval; no counter polling",
+    "target": "offscreen GPU texture, identical format/size/pipelines to viewer; no requestAnimationFrame or vsync",
+    "order": "paired scenes, seeded scene permutation; alternate FP32/FP16 order each round",
+    "wallTime": "batch encoding + submit + query readback wait, not interactive application FPS"
+  }
+}

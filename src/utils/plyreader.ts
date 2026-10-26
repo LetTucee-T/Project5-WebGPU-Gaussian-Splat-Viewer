@@ -6,45 +6,55 @@ export function decodeHeader(plyArrayBuffer: ArrayBuffer): [number, Record<strin
     */
 
     const decoder = new TextDecoder();
-    let headerOffset = 0;
-    let headerText = '';
-
-    while (true) {
-        const headerChunk = new Uint8Array(plyArrayBuffer, headerOffset, 50);
-        headerText += decoder.decode(headerChunk);
-        headerOffset += 50;
-
-        if (headerText.includes('end_header')) {
-            break;
-        }
+    const bytes = new Uint8Array(plyArrayBuffer);
+    const headerLines: string[] = [];
+    let lineStart = 0;
+    let vertexByteOffset = -1;
+    // Byte offsets keep CRLF and UTF-8 comments from shifting the binary body.
+    for (let i = 0; i < Math.min(bytes.length, 1024 * 1024); ++i) {
+        if (bytes[i] !== 10) continue;
+        const line = decoder.decode(bytes.subarray(lineStart, i)).replace(/\r$/, '');
+        headerLines.push(line);
+        lineStart = i + 1;
+        if (line === 'end_header') { vertexByteOffset = i + 1; break; }
+    }
+    if (headerLines[0] !== 'ply' || vertexByteOffset < 0) throw new Error('Invalid or incomplete PLY header.');
+    if (!headerLines.includes('format binary_little_endian 1.0')) {
+        throw new Error('This viewer expects a binary_little_endian 1.0 Gaussian PLY file.');
     }
 
-    const headerLines = headerText.split('\n');
-
     let vertexCount = 0;
-    let propertyTypes: Record<string, string> = {};
+    let propertyTypes: Record<string, string> = Object.create(null);
+    let inVertices = false;
+    let sawVertices = false;
+    const scalarBytes: Record<string, number> = { float: 4, float32: 4, uchar: 1, uint8: 1 };
 
     for (let i = 0; i < headerLines.length; i++) {
         const line = headerLines[i].trim();
-        if (line.startsWith('element vertex')) {
-            const vertexCountMatch = line.match(/\d+/);
-            if (vertexCountMatch) {
-                vertexCount = parseInt(vertexCountMatch[0]);
+        const fields = line.split(/\s+/);
+        if (fields[0] === 'element') {
+            inVertices = fields[1] === 'vertex';
+            if (inVertices) {
+                if (sawVertices) throw new Error('Duplicate PLY vertex element.');
+                sawVertices = true;
+                vertexCount = Number(fields[2]);
+            } else if (!sawVertices && Number(fields[2]) !== 0) {
+                throw new Error('The vertex element must be the first nonempty PLY element.');
             }
-        } else if (line.startsWith('property')) {
-            const propertyMatch = line.match(/(\w+)\s+(\w+)\s+(\w+)/);
-            if (propertyMatch) {
-                const propertyType = propertyMatch[2];
-                const propertyName = propertyMatch[3];
-                propertyTypes[propertyName] = propertyType;
-            }
+        } else if (inVertices && fields[0] === 'property') {
+            const [, type, name] = fields;
+            if (!Object.prototype.hasOwnProperty.call(scalarBytes, type) || fields.length !== 3) throw new Error(`Unsupported PLY property: ${line}`);
+            if (Object.prototype.hasOwnProperty.call(propertyTypes, name)) throw new Error(`Duplicate PLY property: ${name}`);
+            propertyTypes[name] = type;
         } else if (line === 'end_header') {
             break;
         }
     }
 
-    const vertexByteOffset = headerText.indexOf('end_header') + 'end_header'.length + 1;
-    const vertexData = new DataView(plyArrayBuffer, vertexByteOffset);
+    if (!Number.isSafeInteger(vertexCount) || vertexCount < 1) throw new Error('PLY must contain at least one vertex.');
+    const stride = Object.values(propertyTypes).reduce((sum, type) => sum + scalarBytes[type], 0);
+    if (!stride || vertexCount > Math.floor((plyArrayBuffer.byteLength - vertexByteOffset) / stride)) throw new Error('PLY vertex data is truncated.');
+    const vertexData = new DataView(plyArrayBuffer, vertexByteOffset, vertexCount * stride);
 
     return [
         vertexCount,
@@ -58,14 +68,14 @@ export function readRawVertex(offset: number, vertexData: DataView, propertyType
         * - offset: the offset of the next vertex in the vertexData DataView
         * - rawVertex: a map from property names to their values
     */
-    let rawVertex: Record<string, number> = {};
+    let rawVertex: Record<string, number> = Object.create(null);
 
     for (const property in propertyTypes) {
         const propertyType = propertyTypes[property];
-        if (propertyType === 'float') {
+        if (propertyType === 'float' || propertyType === 'float32') {
             rawVertex[property] = vertexData.getFloat32(offset, true);
             offset += Float32Array.BYTES_PER_ELEMENT;
-        } else if (propertyType === 'uchar') {
+        } else if (propertyType === 'uchar' || propertyType === 'uint8') {
             rawVertex[property] = vertexData.getUint8(offset) / 255.0;
             offset += Uint8Array.BYTES_PER_ELEMENT;
         }

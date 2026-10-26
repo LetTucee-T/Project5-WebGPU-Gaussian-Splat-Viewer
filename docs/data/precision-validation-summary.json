@@ -1,0 +1,11 @@
+{
+  "scope": "Automated mixed-precision rendering and numeric validation",
+  "cases": 38,
+  "checks": 194,
+  "passed": true,
+  "webgpuErrors": [],
+  "cpuReference": {
+    "passed": true,
+    "method": "Independent NumPy factorized covariance and Legendre SH; quantized PLY inputs, not GPU outputs."
+  }
+}

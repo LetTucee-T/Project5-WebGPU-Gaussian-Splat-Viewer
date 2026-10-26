@@ -5,6 +5,7 @@ export async function log(msg: string) {
   const p = document.createElement('p');
   p.innerText = msg;
   html_log.appendChild(p);
+  while (html_log.childElementCount > 4) html_log.firstElementChild.remove();
 }
 
 let t: number;

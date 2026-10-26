@@ -1,15 +1,19 @@
 import { PointCloud } from '../utils/load';
 import pointcloud_wgsl from '../shaders/point_cloud.wgsl';
 import { Renderer } from './renderer';
+import type { FrameTiming } from './timing';
 
-export default function get_renderer(
+export default async function get_renderer(
   pc: PointCloud,
   device: GPUDevice,
   presentation_format: GPUTextureFormat,
-  camera_buffer: GPUBuffer): Renderer {
-  const render_shader = device.createShaderModule({code: pointcloud_wgsl});
-  const render_pipeline = device.createRenderPipeline({
-    label: 'render',
+  camera_buffer: GPUBuffer): Promise<Renderer> {
+  const render_shader = device.createShaderModule({label: 'Point cloud MVP', code: pointcloud_wgsl});
+  const compilation = await render_shader.getCompilationInfo();
+  const errors = compilation.messages.filter(message => message.type === 'error');
+  if (errors.length) throw new Error(errors.map(message => message.message).join('\n'));
+  const render_pipeline = await device.createRenderPipelineAsync({
+    label: 'Point cloud render',
     layout: 'auto',
     vertex: {
       module: render_shader,
@@ -39,12 +43,14 @@ export default function get_renderer(
     ],
   });
 
-  const render = (encoder: GPUCommandEncoder, texture_view: GPUTextureView) => {
+  const render = (encoder: GPUCommandEncoder, texture_view: GPUTextureView, timing?: FrameTiming) => {
     const pass = encoder.beginRenderPass({
       label: 'point cloud render',
+      timestampWrites: timing?.render,
       colorAttachments: [
         {
           view: texture_view,
+          clearValue: [0, 0, 0, 1],
           loadOp: 'clear',
           storeOp: 'store',
         }
@@ -59,10 +65,12 @@ export default function get_renderer(
   };
 
   return {
-    frame: (encoder: GPUCommandEncoder, texture_view: GPUTextureView) => {
-      render(encoder, texture_view);
+    frame: (encoder: GPUCommandEncoder, texture_view: GPUTextureView, timing?: FrameTiming) => {
+      render(encoder, texture_view, timing);
     },
 
     camera_buffer,
+    // The application owns the shared input and camera buffers.
+    destroy: () => {},
   };
 }

@@ -24,4 +24,34 @@ dist-ssr
 *.sw?
 /.vite
 
-*/scenes
+# Downloaded course scenes; README documents how to obtain/load them.
+/public/scenes/
+
+# Local experiment workspace. Publish selected media and summaries in docs/.
+/output/
+/milestones/
+/scripts/
+/.codex/
+/.agents/
+.playwright-cli/
+/playwright-report/
+/test-results/
+/tmp/
+/temp/
+
+# Analysis caches and generated measurement dumps.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.tsbuildinfo
+*.npy
+*.npz
+*.ppm
+*.pid
+
+# Machine-local environment configuration.
+.env
+.env.*
+!.env.example

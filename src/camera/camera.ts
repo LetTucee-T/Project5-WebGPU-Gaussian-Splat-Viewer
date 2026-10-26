@@ -1,5 +1,6 @@
 import { Mat3, mat3, Mat4, mat4, Vec3, vec3, Vec2, vec2 } from 'wgpu-matrix';
 import { log, time, timeLog } from '../utils/simple-console';
+import { Bounds, FileData, readFileData } from '../utils/load';
 
 interface CameraJson {
   id: number
@@ -59,35 +60,46 @@ function get_projection_matrix(znear: number, zfar: number, fov_x: number, fov_y
   return p;
 }
 
-interface CameraPreset {
+export interface CameraPreset {
   position: Vec3,
   rotation: Mat4,
+  name: string,
+  intrinsics?: { width: number; height: number; fx: number; fy: number },
 }
 
-export async function load_camera_presets(file: string): Promise<CameraPreset[]> {
-  const blob = new Blob([file]);
-  const arrayBuffer = await new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    
-    reader.onload = function(event) {
-      resolve(event.target.result);  // Resolve the promise with the ArrayBuffer
-    };
-
-    reader.onerror = reject;  // Reject the promise in case of an error
-    reader.readAsArrayBuffer(blob);
-  });
+export async function load_camera_presets(file: FileData): Promise<CameraPreset[]> {
+  const arrayBuffer = await readFileData(file);
   const text = new TextDecoder().decode(arrayBuffer as ArrayBuffer);
   const json = JSON.parse(text);
+  if (!Array.isArray(json) || json.length === 0) throw new Error('Camera JSON must be a nonempty array.');
   log(`loaded cameras count: ${json.length}`);
 
-  return json.map((j: CameraJson): CameraPreset => {
+  return json.map((j: CameraJson, index: number): CameraPreset => {
+    const finiteArray = (a: unknown, n: number): a is number[] => Array.isArray(a) && a.length === n && a.every(v => typeof v === 'number' && Number.isFinite(v));
+    if (!j || !finiteArray(j.position, 3) || !Array.isArray(j.rotation) || j.rotation.length !== 3 || !j.rotation.every(row => finiteArray(row, 3))) {
+      throw new Error(`Camera ${index}: expected a finite position and a 3 x 3 rotation.`);
+    }
+    const r = j.rotation;
+    const determinant = r[0][0] * (r[1][1]*r[2][2]-r[1][2]*r[2][1]) - r[0][1] * (r[1][0]*r[2][2]-r[1][2]*r[2][0]) + r[0][2] * (r[1][0]*r[2][1]-r[1][1]*r[2][0]);
+    // The course's hand-authored Bonsai camera 2 is not exactly orthonormal.
+    // Preserve supplied matrices while rejecting singular, non-invertible data.
+    if (!Number.isFinite(determinant) || Math.abs(determinant) < 1e-8) throw new Error(`Camera ${index}: rotation must be invertible.`);
+    const keys = ['width', 'height', 'fx', 'fy'];
+    let intrinsics: CameraPreset['intrinsics'];
+    if (keys.some(key => j[key] !== undefined)) {
+      if (!keys.every(key => typeof j[key] === 'number' && Number.isFinite(j[key]) && j[key] > 0)) throw new Error(`Camera ${index}: width, height, fx and fy must all be positive.`);
+      intrinsics = { width: j.width, height: j.height, fx: j.fx, fy: j.fy };
+    }
     const position = vec3.clone(j.position);
     // const rotation = mat3.create(...j.rotation.flat());
+    // Camera-to-world rows become world-to-camera columns: this transposes R.
     const rotation = mat4.fromMat3(mat3.create(...j.rotation.flat()));
 
     return {
       position,
       rotation,
+      name: String(j.img_name ?? j.id ?? index),
+      intrinsics,
     };
   });
 }
@@ -126,12 +138,19 @@ export class Camera {
   }
 
   on_update_canvas(): void {
-    const focal = 0.5 * this.canvas.height / Math.tan(this.fovY * 0.5);
-    this.focal[0] = focal;
-    this.focal[1] = focal;
-    this.fovX = focal2fov(focal, this.canvas.width);
-    this.viewport[0] = this.canvas.width;
-    this.viewport[1] = this.canvas.height;
+    const width = Math.max(1, this.canvas.width), height = Math.max(1, this.canvas.height);
+    if (this.intrinsics) {
+      // Fit vertically and retain pixel aspect when the viewport changes shape.
+      const scale = height / this.intrinsics.height;
+      this.focal.set([this.intrinsics.fx * scale, this.intrinsics.fy * scale]);
+      this.fovY = focal2fov(this.focal[1], height);
+    } else {
+      this.fovY = Math.PI / 4;
+      const focal = 0.5 * height / Math.tan(this.fovY * 0.5);
+      this.focal.set([focal, focal]);
+    }
+    this.fovX = focal2fov(this.focal[0], width);
+    this.viewport.set([width, height]);
     // const viewport_ratio = this.canvas.width / this.canvas.height;
 
     this.update_buffer();
@@ -140,7 +159,9 @@ export class Camera {
   readonly uniform_buffer: GPUBuffer;
   
   position = vec3.create();
-  rotation = mat4.create();
+  rotation = mat4.identity();
+  private intrinsics?: CameraPreset['intrinsics'];
+  private far = 100;
   private fovY: number = 45 / 180 * Math.PI;
   private fovX: number;
   private focal: Vec2 = vec2.create();
@@ -157,13 +178,15 @@ export class Camera {
     let offset = 0;
 
     this.view_matrix = get_view_matrix(this.rotation, this.position);
-    this.proj_matrix = get_projection_matrix(0.01, 100, this.fovX, this.fovY);
+    this.proj_matrix = get_projection_matrix(0.01, this.far, this.fovX, this.fovY);
 
     const inv_view_matrix = mat4.inverse(this.view_matrix);
     vec3.transformMat4Upper3x3(vec3.create(0, 0, 1), inv_view_matrix, this.look);
     vec3.normalize(this.look, this.look);
 
-    vec3.cross(this.up, this.look, this.right);
+    vec3.transformMat4Upper3x3(vec3.create(0, 1, 0), inv_view_matrix, this.up);
+    vec3.normalize(this.up, this.up);
+    vec3.transformMat4Upper3x3(vec3.create(1, 0, 0), inv_view_matrix, this.right);
     vec3.normalize(this.right, this.right);
 
     intermediate_float_32_array.set(this.view_matrix, offset);
@@ -184,7 +207,26 @@ export class Camera {
   set_preset(preset: CameraPreset): void {
     vec3.copy(preset.position, this.position);
     mat4.copy(preset.rotation, this.rotation);
+    this.intrinsics = preset.intrinsics;
+    this.far = 100;
+    this.on_update_canvas();
+  }
+
+  frame_bounds(bounds: Bounds): void {
+    const center = bounds.min.map((v, i) => (v + bounds.max[i]) / 2);
+    const radius = Math.max(.1, Math.hypot(...bounds.max.map((v, i) => (v - bounds.min[i]) / 2)));
+    this.intrinsics = undefined;
+    this.on_update_canvas();
+    const tangent = Math.min(this.viewport[0] / (2*this.focal[0]), this.viewport[1] / (2*this.focal[1]));
+    const distance = radius / Math.sin(Math.atan(tangent)) * 1.1;
+    this.position.set([center[0], center[1], center[2] - distance]);
+    mat4.identity(this.rotation);
+    this.far = Math.max(100, distance + 2*radius);
     this.update_buffer();
   }
 
+  snapshot() {
+    return { position: Array.from(this.position), view: Array.from(this.view_matrix), projection: Array.from(this.proj_matrix),
+      viewport: Array.from(this.viewport), focal: Array.from(this.focal), near: .01, far: this.far };
+  }
 };

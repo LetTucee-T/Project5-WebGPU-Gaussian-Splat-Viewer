@@ -18,7 +18,8 @@ const SH_C3 = array<f32,7>(
 );
 
 override workgroupSize: u32;
-override sortKeyPerThread: u32;
+// Sorting capacity is independent of the preprocessing workgroup size.
+override sortKeysPerWorkgroup: u32;
 
 struct DispatchIndirect {
     dispatch_x: atomic<u32>,
@@ -46,7 +47,9 @@ struct CameraUniforms {
 
 struct RenderSettings {
     gaussian_scaling: f32,
-    sh_deg: f32,
+    sh_deg: u32,
+    culling_enabled: u32,
+    display_mode: u32,
 }
 
 struct Gaussian {
@@ -56,10 +59,22 @@ struct Gaussian {
 };
 
 struct Splat {
-    //TODO: store information for 2D splat rendering
+    center: vec4<f32>,          // NDC xyz, positive view depth. Offset 0.
+    conic_opacity: vec4<f32>,   // Inverse pixel covariance (xx,xy,yy), opacity. Offset 16.
+    color: vec4<f32>,           // SH RGB; precision flags (SH=1, rotation=2). Offset 32.
+    extent: vec4<f32>,          // NDC half width/height, pixel radius, unused. Offset 48.
 };
 
-//TODO: bind your data here
+@group(0) @binding(0)
+var<uniform> camera: CameraUniforms;
+@group(0) @binding(1)
+var<uniform> settings: RenderSettings;
+@group(1) @binding(0)
+var<storage, read> gaussians: array<Gaussian>;
+@group(1) @binding(1)
+var<storage, read_write> splats: array<Splat>;
+@group(1) @binding(2)
+var<storage, read> sh_coefficients: array<u32>;
 @group(2) @binding(0)
 var<storage, read_write> sort_infos: SortInfos;
 @group(2) @binding(1)
@@ -69,10 +84,14 @@ var<storage, read_write> sort_indices : array<u32>;
 @group(2) @binding(3)
 var<storage, read_write> sort_dispatch: DispatchIndirect;
 
-/// reads the ith sh coef from the storage buffer 
+// load.ts stores 16 RGB coefficients (48 halves / 24 words) per Gaussian.
+fn sh_scalar(half_index: u32) -> f32 {
+    let pair = unpack2x16float(sh_coefficients[half_index / 2u]);
+    return pair[half_index % 2u];
+}
 fn sh_coef(splat_idx: u32, c_idx: u32) -> vec3<f32> {
-    //TODO: access your binded sh_coeff, see load.ts for how it is stored
-    return vec3<f32>(0.0);
+    let base = splat_idx * 48u + c_idx * 3u;
+    return vec3(sh_scalar(base), sh_scalar(base + 1u), sh_scalar(base + 2u));
 }
 
 // spherical harmonics evaluation with Condon–Shortley phase
@@ -108,11 +127,85 @@ fn computeColorFromSH(dir: vec3<f32>, v_idx: u32, sh_deg: u32) -> vec3<f32> {
     return  max(vec3<f32>(0.), result);
 }
 
-@compute @workgroup_size(workgroupSize,1,1)
-fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) wgs: vec3<u32>) {
-    let idx = gid.x;
-    //TODO: set up pipeline as described in instruction
+fn rotationFromQuaternion32(q: vec4<f32>) -> mat3x3<f32> {
+    let w=q.x; let x=q.y; let y=q.z; let z=q.w;
+    return mat3x3<f32>(
+        vec3(1.-2.*(y*y+z*z), 2.*(x*y+w*z), 2.*(x*z-w*y)),
+        vec3(2.*(x*y-w*z), 1.-2.*(x*x+z*z), 2.*(y*z+w*x)),
+        vec3(2.*(x*z+w*y), 2.*(y*z-w*x), 1.-2.*(x*x+y*y))
+    );
+}
 
-    let keys_per_dispatch = workgroupSize * sortKeyPerThread; 
-    // increment DispatchIndirect.dispatchx each time you reach limit for one dispatch of keys
+@compute @workgroup_size(workgroupSize,1,1)
+fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if idx >= arrayLength(&gaussians) { return; }
+    let gaussian = gaussians[idx];
+    let xy = unpack2x16float(gaussian.pos_opacity[0]);
+    let zo = unpack2x16float(gaussian.pos_opacity[1]);
+    let view_position = camera.view * vec4(xy,zo.x,1.);
+    let clip = camera.proj * view_position;
+    // Retain depth clipping even when optional lateral culling is disabled.
+    if !(clip.w > 0. && clip.z >= 0. && clip.z <= clip.w) { return; }
+    let ndc = clip.xyz / clip.w;
+    if !all(abs(ndc) <= vec3<f32>(3.402823e38)) { return; }
+    if settings.gaussian_scaling <= 0. { return; }
+
+    // Stable sigmoid also maps the course data's +/-infinite logits to 1/0.
+    let e = exp(-abs(zo.y));
+    let opacity = select(e / (1. + e), 1. / (1. + e), zo.y >= 0.);
+    if opacity < 1. / 255. { return; }
+    let q0 = unpack2x16float(gaussian.rot[0]);
+    let q1 = unpack2x16float(gaussian.rot[1]);
+    let raw_q = vec4(q0,q1); // PLY order: w,x,y,z.
+    let norm2 = dot(raw_q,raw_q);
+    if !(norm2 > 1e-12) { return; }
+    let q = raw_q * inverseSqrt(norm2);
+    let scale_xy = unpack2x16float(gaussian.scale[0]);
+    let scale_z_flags = unpack2x16float(gaussian.scale[1]);
+    let scale_z = scale_z_flags.x;
+    let scale = exp(vec3(scale_xy,scale_z)) * settings.gaussian_scaling;
+    let half_rotation = useHalfRotation(scale);
+    let rotation = evaluateRotation(q,half_rotation);
+    let rs = mat3x3(rotation[0]*scale.x,rotation[1]*scale.y,rotation[2]*scale.z);
+    let covariance3d = rs * transpose(rs);
+    let view_linear = mat3x3(camera.view[0].xyz,camera.view[1].xyz,camera.view[2].xyz);
+    let covariance_view = view_linear * covariance3d * transpose(view_linear);
+
+    // Pixel coordinates point down in Y, matching the camera's flipped NDC Y.
+    // Bound the off-axis Jacobian while leaving the projected centre unchanged.
+    let inv_z = 1. / view_position.z;
+    let limit = 1.3 * camera.viewport / (2. * camera.focal);
+    let slope = clamp(view_position.xy * inv_z, -limit, limit);
+    let jx = vec3(camera.focal.x*inv_z,0.,-camera.focal.x*slope.x*inv_z);
+    let jy = vec3(0.,camera.focal.y*inv_z,-camera.focal.y*slope.y*inv_z);
+    // Pixel-space low-pass filter; arithmetic stays f32 in this baseline.
+    let a = dot(jx,covariance_view*jx) + 0.3;
+    let b = dot(jx,covariance_view*jy);
+    let c = dot(jy,covariance_view*jy) + 0.3;
+    let det = a*c-b*b;
+    if !(det > 0.) { return; }
+    let conic = vec3(c,-b,a) / det;
+    let half_difference = 0.5*(a-c);
+    let lambda_max = 0.5*(a+c) + sqrt(max(0.1,half_difference*half_difference+b*b));
+    let radius = ceil(3. * sqrt(lambda_max));
+    let half_extent = 2. * vec2(radius) / camera.viewport;
+    if !(radius > 0. && radius <= 3.402823e38) || !all(abs(conic) <= vec3(3.402823e38)) { return; }
+    if settings.culling_enabled != 0u && any(abs(ndc.xy) > vec2(1.2) + half_extent) { return; }
+
+    let camera_position = camera.view_inv[3].xyz;
+    let direction = normalize(vec3(xy,zo.x)-camera_position);
+    let half_sh = useHalfSH(scale_z_flags.y > 0.5);
+    let color = evaluateSH(direction,idx,min(settings.sh_deg,3u),half_sh);
+    let precision_flags = u32(half_sh) | (u32(half_rotation) << 1u);
+    // Preserve original identities; sort only the compacted index/key pairs.
+    splats[idx] = Splat(vec4(ndc,view_position.z),vec4(conic,opacity),vec4(color,f32(precision_flags)),vec4(half_extent,radius,0.));
+    let slot = atomicAdd(&sort_infos.keys_size,1u);
+    sort_indices[slot] = idx;
+    // Positive finite depths have monotonic IEEE bits. Invert for far-to-near
+    // order with the supplied ascending unsigned radix sort (padding stays UINT_MAX).
+    sort_depths[slot] = ~bitcast<u32>(view_position.z);
+    if slot % sortKeysPerWorkgroup == 0u {
+        atomicAdd(&sort_dispatch.dispatch_x,1u);
+    }
 }

@@ -3,14 +3,18 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>WebGPU 3D Gaussian Splat Viewer</title>
+    <link rel="icon" href="data:," />
+    <title>WebGPU Gaussian Viewer · Gaussian Splats</title>
   </head>
   <body>
     <div class="console">
-      <h4 id="title">WebGPU 3D Gaussian Splat Viewer</h4>
+      <h1 id="title">WebGPU Gaussian Viewer</h1>
+      <p class="stage">GAUSSIAN SPLATS · FP32 / FP16 MIXED</p>
+      <p id="status" role="status">Starting WebGPU…</p>
+      <p class="help">Left drag: rotate · Right drag: pan · Wheel: move<br />0–9: camera presets · Reset view: camera 0<br />Display: Gaussian or debug views · Scale: 3D Gaussian size</p>
       <div id="log"></div>
     </div>
-    <canvas id="webgpu-canvas" />
+    <canvas id="webgpu-canvas" aria-label="Gaussian viewer rendering"></canvas>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

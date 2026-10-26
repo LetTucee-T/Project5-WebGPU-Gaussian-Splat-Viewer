@@ -12,7 +12,8 @@ import radix_sort_wgsl from './radix_sort.wgsl';
 import { align } from '../utils/util';
 
 export interface SortStuff {
-  sort: (encoder: GPUCommandEncoder) => void,
+  sort: (encoder: GPUCommandEncoder, timing?: GPUComputePassTimestampWrites) => void,
+  destroy: () => void,
   sort_info_buffer: GPUBuffer,
   sort_dispatch_indirect_buffer: GPUBuffer,
 
@@ -29,7 +30,8 @@ function create_ping_pong_buffer(adjusted_count: number, keysize: number, device
     // payload
     sort_indices_buffer: device.createBuffer({
       label: 'ping pong sort indices',
-      size: keysize * 4,
+      // Scatter reads/writes a complete block, including sentinel payloads.
+      size: adjusted_count * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     }),
     // key
@@ -62,7 +64,7 @@ export const C = {
 const c_rs_smem_phase_2 = C.rs_radix_size + C.rs_scatter_block_rows * C.scatter_wg_size;
 C.rs_mem_dwords = c_rs_smem_phase_2;
 
-function create_pipelines(device: GPUDevice) {
+async function create_pipelines(device: GPUDevice) {
   // storage array length cannot use override, use string concat const instead
   const module = device.createShaderModule({
     label: 'radix sort',
@@ -72,6 +74,9 @@ function create_pipelines(device: GPUDevice) {
     `
   });
 
+  const compilation = await module.getCompilationInfo();
+  const errors = compilation.messages.filter(message => message.type === 'error');
+  if (errors.length) throw new Error(errors.map(message => message.message).join('\n'));
   const bind_group_layout = device.createBindGroupLayout({
     entries: [
       // info
@@ -132,7 +137,7 @@ function create_pipelines(device: GPUDevice) {
 
   return {
     bind_group_layout,
-    zero: device.createComputePipeline({
+    zero: await device.createComputePipelineAsync({
       // label: 'zero histograms',
       // layout: 'auto',
       layout: pipeline_layout,
@@ -147,14 +152,14 @@ function create_pipelines(device: GPUDevice) {
         }
       },
     }),
-    histogram: device.createComputePipeline({
+    histogram: await device.createComputePipelineAsync({
       layout: pipeline_layout,
       compute: {
         module: module,
         entryPoint: 'calculate_histogram',
       }
     }),
-    prefix: device.createComputePipeline({
+    prefix: await device.createComputePipelineAsync({
       layout: pipeline_layout,
       compute: {
         module: module,
@@ -165,7 +170,7 @@ function create_pipelines(device: GPUDevice) {
         }
       }
     }),
-    scatter_odd: device.createComputePipeline({
+    scatter_odd: await device.createComputePipelineAsync({
       layout: pipeline_layout,
       compute: {
         module: module,
@@ -180,7 +185,7 @@ function create_pipelines(device: GPUDevice) {
         }
       }
     }),
-    scatter_even: device.createComputePipeline({
+    scatter_even: await device.createComputePipelineAsync({
       layout: pipeline_layout,
       compute: {
         module: module,
@@ -254,13 +259,18 @@ function create_histogram_buffer(keysize: number, device: GPUDevice) {
 }
 
 const num_pass = 4;
+const pipelineCache = new WeakMap<GPUDevice, ReturnType<typeof create_pipelines>>();
 
-export function get_sorter(keysize: number, device: GPUDevice): SortStuff {
+export async function get_sorter(keysize: number, device: GPUDevice): Promise<SortStuff> {
   const keys_per_workgroup = C.histogram_wg_size * C.rs_histogram_block_rows;
-  const keys_count_adjusted = (Math.floor((keysize + keys_per_workgroup - 1) / keys_per_workgroup) + 1) * keys_per_workgroup;
-
-  console.log(`keys count adjusted: ${keys_count_adjusted}`); // histogram count
-  console.log(`key size: ${keysize}`);
+  const capacityBlocks = Math.max(1, Math.ceil(keysize / keys_per_workgroup));
+  const keys_count_adjusted = capacityBlocks * keys_per_workgroup;
+  if (keys_count_adjusted * 4 > Math.min(device.limits.maxBufferSize, device.limits.maxStorageBufferBindingSize)) {
+    throw new Error('Sorting buffers exceed this GPU\'s storage limit.');
+  }
+  let pending = pipelineCache.get(device);
+  if (!pending) { pending = create_pipelines(device); pipelineCache.set(device,pending); }
+  const pipelines = await pending;
 
   const sort_info_buffer = device.createBuffer({
     label: 'sort info',
@@ -271,10 +281,8 @@ export function get_sorter(keysize: number, device: GPUDevice): SortStuff {
   const sort_dispatch_indirect_buffer = device.createBuffer({
     label: 'sort dispatch indirect',
     size: 3 * 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.INDIRECT,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC | GPUBufferUsage.INDIRECT,
   });
-
-  const pipelines = create_pipelines(device);
 
   const ping_pong = [
     create_ping_pong_buffer(keys_count_adjusted, keysize, device),
@@ -284,7 +292,7 @@ export function get_sorter(keysize: number, device: GPUDevice): SortStuff {
   const histogram_buffer = create_histogram_buffer(keysize, device);
 
   const { scatter_blocks_ru, count_ru_histo } = get_scatter_histogram_sizes(keysize);
-  device.queue.writeBuffer(sort_info_buffer, 0, new Uint32Array([keysize, count_ru_histo, num_pass, 0, 0]));
+  device.queue.writeBuffer(sort_info_buffer, 0, new Uint32Array([0, count_ru_histo, num_pass, 0, 1]));
   device.queue.writeBuffer(sort_dispatch_indirect_buffer, 0, new Uint32Array([scatter_blocks_ru, 1, 1]));
 
   const bind_group = device.createBindGroup({
@@ -300,14 +308,16 @@ export function get_sorter(keysize: number, device: GPUDevice): SortStuff {
     ]
   });
 
-  function record_calculate_histogram_indirect(encoder: GPUCommandEncoder) {
+  function record_calculate_histogram_indirect(encoder: GPUCommandEncoder, timing?: GPUComputePassTimestampWrites) {
     {
       const pass = encoder.beginComputePass({
         label: 'zeroing histogram',
+        timestampWrites: timing ? {querySet:timing.querySet,beginningOfPassWriteIndex:timing.beginningOfPassWriteIndex} : undefined,
       });
       pass.setPipeline(pipelines.zero);
       pass.setBindGroup(0, bind_group);
-      pass.dispatchWorkgroupsIndirect(sort_dispatch_indirect_buffer, 0);
+      // Always reset metadata/histograms, including frames with zero visible points.
+      pass.dispatchWorkgroups(capacityBlocks);
       pass.end();
     }
     {
@@ -331,9 +341,10 @@ export function get_sorter(keysize: number, device: GPUDevice): SortStuff {
     pass.end();
   }
 
-  function record_scatter_keys_indirect(encoder: GPUCommandEncoder) {
+  function record_scatter_keys_indirect(encoder: GPUCommandEncoder, timing?: GPUComputePassTimestampWrites) {
     const pass = encoder.beginComputePass({
       label: 'scatter keyvals',
+      timestampWrites: timing ? {querySet:timing.querySet,endOfPassWriteIndex:timing.endOfPassWriteIndex} : undefined,
     });
     pass.setBindGroup(0, bind_group);
 
@@ -350,11 +361,24 @@ export function get_sorter(keysize: number, device: GPUDevice): SortStuff {
     pass.end();
   }
 
-  function sort(encoder: GPUCommandEncoder) {
-    record_calculate_histogram_indirect(encoder);
+  function sort(encoder: GPUCommandEncoder, timing?: GPUComputePassTimestampWrites) {
+    record_calculate_histogram_indirect(encoder,timing);
     record_prefix_histogram(encoder);
-    record_scatter_keys_indirect(encoder);
+    record_scatter_keys_indirect(encoder,timing);
   };
+
+  let destroyed = false;
+  function destroy() {
+    if (destroyed) return;
+    destroyed = true;
+    sort_info_buffer.destroy();
+    sort_dispatch_indirect_buffer.destroy();
+    histogram_buffer.destroy();
+    for (const pair of ping_pong) {
+      pair.sort_indices_buffer.destroy();
+      pair.sort_depths_buffer.destroy();
+    }
+  }
 
   return {
     sort_info_buffer,
@@ -362,5 +386,6 @@ export function get_sorter(keysize: number, device: GPUDevice): SortStuff {
     ping_pong,
 
     sort,
+    destroy,
   };
 }
