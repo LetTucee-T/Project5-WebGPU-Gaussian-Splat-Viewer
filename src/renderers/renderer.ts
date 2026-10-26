@@ -85,7 +85,9 @@ export default async function init(canvas: HTMLCanvasElement, context: GPUCanvas
   presetInput.element.querySelector('input')?.setAttribute('aria-label','Camera index');
   const describe = () => setStatus(pc
     ? `${sceneName} · ${pc.num_points.toLocaleString()} points · ${cameras.length ? 'camera ' + currentPreset + ' / ' + (cameras.length - 1) : 'auto-framed view'}${params.renderer === 'gaussian' ? ' · ' + (activeScene?.gaussian.precision().active === 'f16' ? 'FP16 / Mixed' : 'FP32') : ''}${!device.features.has('shader-f16') ? ' · FP16 unavailable' : ''}`
-    : 'Load Bonsai, or choose a Gaussian PLY and optional camera JSON.');
+    : import.meta.env.VITE_HAS_BUNDLED_BONSAI
+      ? 'Load Bonsai, or choose a Gaussian PLY and optional camera JSON.'
+      : 'Choose a Gaussian PLY and optional camera JSON to start.');
   function applyPreset(index: number) {
     if (!Number.isInteger(index) || index < 0 || index >= cameras.length) {
       params.camera = currentPreset;
@@ -206,7 +208,7 @@ export default async function init(canvas: HTMLCanvasElement, context: GPUCanvas
     .on('change', e => { if (updatingFileControls) return; if (e.value instanceof File) void loadPly(e.value); else clearPly(); });
   pane.addInput(params, 'cam_file', { label: 'Camera JSON', view: 'file-input', lineCount: 2, filetypes: ['.json'] })
     .on('change', e => { if (updatingFileControls) return; if (e.value instanceof File) void loadCameras(e.value); else clearCameras(); });
-  pane.addButton({ title: 'Load Bonsai' }).on('click', async () => {
+  if (import.meta.env.VITE_HAS_BUNDLED_BONSAI) pane.addButton({ title: 'Load Bonsai' }).on('click', async () => {
     const ticket = ++sceneRequest, cameraTicket = ++cameraRequest;
     loading++;
     setStatus('Loading course Bonsai scene…');

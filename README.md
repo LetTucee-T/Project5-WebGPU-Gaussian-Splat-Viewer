@@ -4,6 +4,8 @@
 
 A WebGPU viewer that reconstructs pretrained 3D Gaussian scenes through anisotropic splats, view-dependent color, and depth-sorted alpha blending. The viewer includes a point-cloud comparison, rendering diagnostics, and a selectable half-precision preprocessing path.
 
+**[Open the live viewer](https://lettucee-t.github.io/Project5-WebGPU-Gaussian-Splat-Viewer/)** in a WebGPU-capable browser. Choose a Gaussian PLY and optional camera JSON from the [course scene files](https://drive.google.com/drive/folders/1Fz0QhyDU12JTsl2e7umGi5iy_V9drrIW?usp=sharing); files are processed locally in your browser.
+
 ![The course Bonsai scene rendered with mixed-precision Gaussian splats](docs/images/bonsai-mixed.png)
 
 *Bonsai scene, 272,956 input Gaussians, 1280 × 720, FP16 / Mixed preprocessing.*
@@ -74,7 +76,7 @@ npm run preview
 
 The build performs TypeScript checking and produces the viewer in `dist/`. Selected figures and data are in [docs](docs/), with the [measurement protocol](docs/data/measurement-method.json) recorded alongside the results.
 
-For GitHub Pages deployment, enable the repository's Actions workflows and select **Settings → Pages → Source: GitHub Actions**. The included workflow builds and deploys pushes to `main`; the hosted viewer accepts local PLY and camera JSON files through the same controls.
+GitHub Actions builds and deploys `main` to the [live viewer](https://lettucee-t.github.io/Project5-WebGPU-Gaussian-Splat-Viewer/). The hosted viewer accepts local PLY and camera JSON files; **Load Bonsai** appears in builds that include the Bonsai scene files.
 
 ## Credits
 
